@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
@@ -31,6 +34,8 @@ type Client struct {
 	connected     bool
 	http          *http.Client
 	interval      time.Duration
+	creds         Credentials
+	cookies       []*http.Cookie
 }
 
 // Message is the type delivered to subscribers.
@@ -267,19 +272,86 @@ func (c *Client) subscribe(pattern string, out chan<- *Message, ext interface{})
 	return nil
 }
 
+type Credentials struct {
+	AccessToken string `json:"access_token"`
+	InstanceURL string `json:"instance_url"`
+	IssuedAt    int
+	ID          string
+	TokenType   string `json:"token_type"`
+	Signature   string
+}
+
+func GetSalesforceCredentials() Credentials {
+	route := mustGetEnv("SALESFORCE_URL")
+	clientID := mustGetEnv("SALESFORCE_CLIENT_ID")
+	clientSecret := mustGetEnv("SALESFORCE_CLIENT_SECRET")
+	username := mustGetEnv("SALESFORCE_USERNAME")
+	password := mustGetEnv("SALESFORCE_PASSWORD")
+	params := url.Values{"grant_type": {"password"},
+		"client_id":     {clientID},
+		"client_secret": {clientSecret},
+		"username":      {username},
+		"password":      {password}}
+	res, err := http.PostForm(route, params)
+	if err != nil {
+		log.Fatal(err)
+	}
+	decoder := json.NewDecoder(res.Body)
+	var creds Credentials
+	if err := decoder.Decode(&creds); err == io.EOF {
+		log.Fatal(err)
+	} else if err != nil {
+		log.Fatal(err)
+	} else if creds.AccessToken == "" {
+		log.Fatalf("Unable to fetch access token. Check credentials in environmental variables")
+	}
+	return creds
+}
+
+func mustGetEnv(s string) string {
+	r := os.Getenv(s)
+	if r == "" {
+		panic(fmt.Sprintf("Could not fetch key %s", s))
+	}
+	return r
+}
+
 func (c *Client) send(req *request) (*metaMessage, error) {
+
+	if c.creds.AccessToken == "" {
+		creds := GetSalesforceCredentials()
+		c.creds = creds
+	}
+
+	// We need to save handshake cookies and send them with requests to salesforce
+	var save_cookies = false
+	if req.Channel == "/meta/handshake" {
+		save_cookies = true
+	}
+
 	data, err := json.Marshal([]*request{req})
 	if err != nil {
 		return nil, err
 	}
 	buffer := bytes.NewBuffer(data)
-	rsp, err := c.http.Post(c.url, "application/json", buffer)
+
+	request, err := http.NewRequest("POST", c.url, buffer)
+	request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.creds.AccessToken))
+	request.Header.Set("Content-Type", "application/json")
+	for _, cookie := range c.cookies {
+			request.AddCookie(cookie)
+		  }
+	rsp, err := c.http.Do(request)
 	if err != nil {
 		return nil, err
 	}
 
 	if rsp.StatusCode != 200 {
 		return nil, fmt.Errorf("HTTP Status %d", rsp.StatusCode)
+	}
+
+	if save_cookies {
+		c.cookies = rsp.Cookies()
 	}
 
 	data, err = ioutil.ReadAll(rsp.Body)
@@ -302,7 +374,8 @@ func (c *Client) send(req *request) (*metaMessage, error) {
 		if req.Channel == msg.Channel {
 			reply = &msg
 		} else {
-			c.messages <- &msg.Message
+			newmsg := msg
+			c.messages <- &newmsg.Message
 		}
 	}
 
